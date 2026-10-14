@@ -39,5 +39,6 @@ La ruta admite elegir un ejecutable DX12, pero **no está validada en cualquier 
 6. [Artefactos, verificaciones y límites](docs/ARTEFACTOS.md).
 7. [Procedencia y licencias](NOTICE.md).
 8. [Instaladores públicos: contenido, aporte local y hashes](docs/INSTALADORES-PUBLICOS.md).
+9. [Preparación guiada: selección de modelo local y runtime oficial](docs/INSTALACION-GUIADA.md).
 
 Los ficheros de `src/native` incluyen ensayos descartados además de producción. **No activar todos los defines experimentales**: el script de compilación fija la política aceptada. Los resultados históricos no prueban que todo el directorio esté validado para publicación o despliegue en juego.

@@ -27,7 +27,7 @@ public sealed class Slice : Stream {
  public override void Flush(){} public override void SetLength(long v){throw new NotSupportedException();} public override void Write(byte[] b,int o,int n){throw new NotSupportedException();}
 }
 
-public static class Engine {
+public static partial class Engine {
  [System.Runtime.InteropServices.DllImport("kernel32.dll",CharSet=System.Runtime.InteropServices.CharSet.Unicode,SetLastError=true)]
  static extern bool CreateHardLink(string target,string existing,IntPtr reserved);
  static void ValidateExecutable(string path){using(var s=File.OpenRead(path))using(var r=new BinaryReader(s)){
@@ -152,10 +152,7 @@ public static class Engine {
   if(!String.Equals(Path.GetFullPath(game),state.game,StringComparison.OrdinalIgnoreCase))throw new IOException("El registro pertenece a otra carpeta");
   Restore(state,log);
  }
- public static void RegisterLocalModel(string executable,Action<string> log,bool verifyOnly=false){
-  string exe=Path.GetFullPath(executable),game=Path.GetDirectoryName(exe);Closed(exe);Hardware();ValidateExecutable(exe);
-  var state=Json.Deserialize<State>(File.ReadAllText(Journal(game)));
-  if(state.game!=game||state.executable!=exe||!state.complete||state.removed)throw new IOException("Instala primero este paquete publico en el juego elegido.");
+ static List<Dictionary<string,object>> ValidateModelRoot(string game){
   var manifests=new List<Dictionary<string,object>>();int[,] geometry={{320,180,320,192},{512,288,512,320},{640,360,640,384},{960,540,960,576},{1280,720,1280,768}};
   for(int i=0;i<5;i++){
    string relative="native_nr_modes/assets-"+geometry[i,1]+"/assets.txt",manifest=Safe(game,relative),model=Path.GetDirectoryName(manifest);
@@ -168,6 +165,13 @@ public static class Engine {
     string file=Safe(model,col[2]);if(!File.Exists(file)||new FileInfo(file).Length!=bytes||Hash(file)!=col[1])throw new IOException("Modelo incompleto o alterado: "+col[2]);}
    manifests.Add(new Dictionary<string,object>{{"path",relative},{"sha256",Hash(manifest)}});
   }
+  return manifests;
+ }
+ public static void RegisterLocalModel(string executable,Action<string> log,bool verifyOnly=false){
+  string exe=Path.GetFullPath(executable),game=Path.GetDirectoryName(exe);Closed(exe);Hardware();ValidateExecutable(exe);
+  var state=Json.Deserialize<State>(File.ReadAllText(Journal(game)));
+  if(state.game!=game||state.executable!=exe||!state.complete||state.removed)throw new IOException("Instala primero este paquete publico en el juego elegido.");
+  var manifests=ValidateModelRoot(game);
   var contract=Json.Deserialize<List<Item>>(File.ReadAllText(Safe(game,"nr-launcher/runtime-contract.json")));
   if(contract==null||contract.Count==0||contract.Count>32)throw new IOException("Contrato SDK invalido.");
   foreach(var item in contract){if(!item.path.StartsWith("native_nr_runtime/",StringComparison.Ordinal))throw new IOException("Ruta SDK invalida.");string file=Safe(game,item.path);if(!File.Exists(file)||new FileInfo(file).Length!=item.bytes||Hash(file)!=item.sha256)throw new IOException("Runtime local ausente o incompatible: "+item.path);}
@@ -190,8 +194,8 @@ public class InstallerForm : Form {
   Controls.Add(new Label{Text="DX12 / SDR · B580 referencia probada · B570 experimental sin prueba fisica\nCinco modos de 180p a 720p; inicio 320x180 con NR desactivado.\nReferencia: Spider-Man 2. Otros juegos: compatibilidad experimental.",Left=20,Top=65,Width=710,Height=90});
 #if PUBLIC_PACKAGE
   foreach(Control control in Controls)if(control is Label&&control.Top==65)control.Text="PAQUETE PUBLICO SIN PESOS NI SDK EXPERIMENTAL. NR requiere aporte local.\nOptiScaler base puede usarse sin NR. Consulta LEEME-Publico.txt.\nB580 referencia; B570 experimental solo en la variante B570-B580.";
-  var register=new Button{Text="Modelo local",Left=637,Top=211,Width=105,Height=35};Controls.Add(register);
-  register.Click+=(s,e)=>{if(busy)return;try{Engine.RegisterLocalModel(folder.Text.Trim(),Print);}catch(Exception error){Print("Error: "+error.Message);}};
+  var register=new Button{Text="Preparar NR",Left=637,Top=211,Width=105,Height=35};Controls.Add(register);
+  register.Click+=async(s,e)=>{if(busy)return;busy=true;install.Enabled=remove.Enabled=browse.Enabled=folder.Enabled=wrapper.Enabled=register.Enabled=false;try{await GuidedSetup.Run(folder.Text.Trim(),this,Print);}catch(Exception error){Print("Error: "+error.Message);}finally{busy=false;install.Enabled=remove.Enabled=browse.Enabled=folder.Enabled=wrapper.Enabled=register.Enabled=true;}};
 #endif
 #if B580_ONLY
   Text="OptiScaler + NR — B580 / paquete publico";
@@ -225,6 +229,11 @@ public static class Program {
   if(file.Length<32)throw new IOException("No hay paquete incrustado");file.Position=file.Length-32;using(var r=new BinaryReader(file,Encoding.ASCII,true)){if(Encoding.ASCII.GetString(r.ReadBytes(16))!="NRSETUPGENV1PACK")throw new IOException("Paquete no encontrado");offset=r.ReadInt64();length=r.ReadInt64();if(offset<=0||length<=0||offset+length!=file.Length-32)throw new IOException("Paquete truncado");}
  }
  [STAThread] public static int Main(string[] args){try{
+#if PUBLIC_PACKAGE
+  if(args.Length==4&&args[0]=="--import-local"){Engine.ImportLocalModel(args[1],args[2],args[3],Console.WriteLine);return 0;}
+  if(args.Length==2&&args[0]=="--profile-test"){Console.WriteLine(GuidedSetup.Profile(args[1]));return 0;}
+  if(args.Length==4&&args[0]=="--extract-sdk-test"){var contract=Engine.Json.Deserialize<List<Item>>(File.ReadAllText(args[3]));Console.WriteLine(Engine.ExtractOfficialRuntime(args[1],args[2],contract));return 0;}
+#endif
   if(args.Length==2&&args[0]=="--register-model"){Engine.RegisterLocalModel(args[1],Console.WriteLine);return 0;}
   if(args.Length==2&&args[0]=="--check-model"){Engine.RegisterLocalModel(args[1],Console.WriteLine,true);return 0;}
   if(args.Length==2&&args[0]=="--hardware-test"){Console.WriteLine(Engine.SupportedHardware(args[1])?"SUPPORTED":"UNSUPPORTED");return Engine.SupportedHardware(args[1])?0:1;}

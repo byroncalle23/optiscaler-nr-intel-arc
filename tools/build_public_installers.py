@@ -2,9 +2,9 @@
 from pathlib import Path
 import hashlib,json,struct,subprocess,zipfile,shutil,io,argparse
 root=Path(__file__).resolve().parents[1]
-ap=argparse.ArgumentParser();ap.add_argument('--local-dist',type=Path,default=root/'dist');args=ap.parse_args()
-bank=root/'work/b580/public-installers';bank.mkdir(parents=True,exist_ok=True)
-dist=args.local_dist.resolve();dist.mkdir(parents=True,exist_ok=True)
+ap=argparse.ArgumentParser();ap.add_argument('--local-dist',type=Path,default=root/'dist');ap.add_argument('--guided',action='store_true');args=ap.parse_args()
+bank=root/('work/b580/public-guided-installers' if args.guided else 'work/b580/public-installers');bank.mkdir(parents=True,exist_ok=True)
+dist=(args.local_dist/'guided' if args.guided else args.local_dist).resolve();dist.mkdir(parents=True,exist_ok=True)
 def sha(p):
  with p.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
 def local_zip(path):
@@ -58,6 +58,24 @@ B570: experimental, sin prueba fisica. DX12/SDR; otros juegos no validados.
 Requiem requiere su integracion especifica. No hay garantia de FPS.
 Codigo y documentacion: https://github.com/byroncalle23/optiscaler-nr-intel-arc
 '''
+ if args.guided:
+  readme='''PREPARACION GUIADA v1.3 / SIN PESOS NI RUNTIME INCLUIDOS
+1. Con el juego cerrado, selecciona el ejecutable y pulsa Instalar.
+2. Pulsa Preparar NR. Selecciona un paquete local compatible que contenga
+   native_nr_modes/assets-180/288/360/540/720. No sirve una DLL NVIDIA suelta.
+3. Se verifican e importan los modelos, sin descargar ni extraer pesos.
+4. Si falta el runtime, se ofrece descargar Microsoft 1.721.3-preview desde
+   NuGet oficial; se muestra la licencia y solo se instala si la aceptas.
+   Si el paquete local ya contiene el runtime compatible, se utiliza ese.
+5. Ejecuta Launch-OptiScaler-NR.bat y activa NR desde Insert > Custom.
+   Comprueba el temporal en juego: preparar archivos no certifica compatibilidad.
+Spider-Man 2: referencia. RE2/3/4: experimental/DX12, sin temporal validado.
+Requiem: este paquete sigue bloqueado; usa su integracion especifica.
+Los archivos importados por el asistente se registran para restaurarlos al
+desinstalar; archivos que ya existian iguales no se apropian ni se borran.
+Los instaladores completos originales y sus referencias se conservan intactos.
+Codigo y documentacion: https://github.com/byroncalle23/optiscaler-nr-intel-arc
+'''
  files['LEEME-Publico.txt']=readme.encode()
  files['nr-docs/SOURCE.txt']=b'Corresponding source: https://github.com/byroncalle23/optiscaler-nr-intel-arc\nOptiScaler base commit: 7651154215172af82d9d39ef5efb3798ff1e3703\n'
  for label,folder in license_roots.items():
@@ -69,7 +87,7 @@ Codigo y documentacion: https://github.com/byroncalle23/optiscaler-nr-intel-arc
   assert not name.startswith(('native_nr_modes/','native_nr_runtime/'))
   digest=hashlib.sha256(data).hexdigest();blobs[digest]=data
   items.append(dict(path=name,sha256=digest,blob=digest,bytes=len(data),mode='preserve' if name=='OptiScaler.ini' else 'replace',component='Paquete publico sin pesos'))
- manifest=dict(version='1.2.0-public-no-model-'+variant,scope='B580 tested; B570 experimental if selected; model/runtime supplied locally',weights_included=False,experimental_sdk_included=False,files=items)
+ manifest=dict(version=('1.3.0-guided-' if args.guided else '1.2.0-public-no-model-')+variant,scope='B580 tested; B570 experimental if selected; model/runtime supplied locally',weights_included=False,experimental_sdk_included=False,files=items)
  stage=bank/variant;stage.mkdir(exist_ok=True)
  (stage/'package.json').write_text(json.dumps(manifest,indent=2))
  archive=stage/'payload.zip'
@@ -79,7 +97,7 @@ Codigo y documentacion: https://github.com/byroncalle23/optiscaler-nr-intel-arc
  csc=Path('C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe');refs=['System.Windows.Forms.dll','System.Drawing.dll','System.Web.Extensions.dll','System.IO.Compression.dll','System.IO.Compression.FileSystem.dll','System.Management.dll']
  compiler=[str(csc),'/nologo','/optimize+','/platform:x64','/define:PUBLIC_PACKAGE'+(';B580_ONLY' if variant=='B580' else '')]+['/reference:'+r for r in refs]
  for target,name in [('winexe','bootstrap.exe'),('exe','installer-test.exe')]:
-  subprocess.run(compiler+['/target:'+target,'/out:'+str(stage/name)]+(['/win32manifest:'+str(root/'work/b580/generic-installer/generated/app.manifest')] if target=='winexe' else [])+[str(root/'installer/GenericInstaller.cs')],check=True)
+  subprocess.run(compiler+['/target:'+target,'/out:'+str(stage/name)]+(['/win32manifest:'+str(root/'work/b580/generic-installer/generated/app.manifest')] if target=='winexe' else [])+[str(root/'installer/GenericInstaller.cs'),str(root/'installer/GuidedSetup.cs')],check=True)
  output=dist/('OptiScaler-NR-Publico-'+variant+'-SinPesos-Setup.exe');shutil.copyfile(stage/'bootstrap.exe',output);offset=output.stat().st_size
  with output.open('ab') as f,archive.open('rb') as inp:shutil.copyfileobj(inp,f);f.write(b'NRSETUPGENV1PACK'+struct.pack('<qq',offset,archive.stat().st_size))
  result=dict(variant=variant,file=output.name,sha256=sha(output),bytes=output.stat().st_size,files=len(items),weights_included=False,experimental_sdk_included=False,ready_for_nr_without_local_model=False)
