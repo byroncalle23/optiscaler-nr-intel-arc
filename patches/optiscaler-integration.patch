@@ -1,0 +1,844 @@
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index 6404a9c..f8b7de1 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -1460,6 +1460,11 @@ DWORD WINAPI getGpuInfo(LPVOID hModuleVoid)
+ 
+ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+ {
++#if defined(OPTISCALER_NATIVE_NR_TEST_HOST)
++    // Isolated DLL inference host: explicit NR API only; skip OptiScaler's
++    // automatic game detection, loader hooks, background threads and shutdown.
++    return TRUE;
++#endif
+     switch (ul_reason_for_call)
+     {
+     case DLL_PROCESS_ATTACH:
+diff --git a/OptiScaler/experimental/NativeNrControl.h b/OptiScaler/experimental/NativeNrControl.h
+new file mode 100644
+index 0000000..23ee2bb
+--- /dev/null
++++ b/OptiScaler/experimental/NativeNrControl.h
+@@ -0,0 +1,64 @@
++#pragma once
++#include <atomic>
++#include <imgui/imgui.h>
++#include "NativeNrModes.h"
++
++// Request only: the render callback owns initialization and GPU resources.
++// -1 is an unread startup setting. Menu changes never persist to the INI.
++namespace NativeNrControl {
++inline std::atomic<int> requested{-1};
++inline std::atomic<int> progress{0}; // 0 idle, 1 preparing, 2 recording, 3 failed
++inline std::atomic<bool> temporalRequested{false};
++inline std::atomic<bool> temporalApplied{false};
++inline std::atomic<int> temporalProgress{0}; // 0 missing inputs, 1 preparing, 2 captured, 3 unsupported
++inline void Startup(bool enabled){int unset=-1;requested.compare_exchange_strong(unset,enabled?1:0);}
++inline bool Enabled(){return requested.load(std::memory_order_acquire)==1;}
++inline void Set(bool enabled){requested.store(enabled?1:0,std::memory_order_release);}
++}
++
++bool NativeNrIsEnabled();
++void NativeNrSetEnabled(bool enabled);
++
++// Same widget in the game and in the headless ImGui interaction test.
++inline bool DrawNativeNrCheckbox(){
++    ImGui::Separator();
++    bool enabled=NativeNrIsEnabled();
++    if(ImGui::Checkbox("Reconstruccion neuronal experimental",&enabled))NativeNrSetEnabled(enabled);
++    return enabled;
++}
++inline void RenderNativeNrControl(){
++    bool enabled=DrawNativeNrCheckbox();
++#ifdef NR_GAME_MODES
++    int selected=NativeNrModes::requested.load();
++    if(ImGui::BeginCombo("Modo neuronal",NativeNrModes::modes[selected].label)){
++        for(int i=0;i<5;++i)if(ImGui::Selectable(NativeNrModes::modes[i].label,selected==i))NativeNrModes::Set(i);
++        ImGui::EndCombo();
++    }
++    if(enabled&&NativeNrModes::failure.load()==1)ImGui::TextWrapped("VRAM disponible insuficiente para este modo. Elige uno menor o reduce el uso de memoria del juego.");
++    else if(enabled&&NativeNrModes::failure.load()==2)ImGui::TextWrapped("Cambio pendiente: la grabacion anterior no termino. Elige otro modo para reintentar.");
++    else if(enabled&&NativeNrModes::active.load()!=NativeNrModes::requested.load()&&NativeNrModes::failure.load()==0)ImGui::TextWrapped("Preparando el modo elegido; el historial se reiniciara.");
++#endif
++    if(!enabled)ImGui::TextUnformatted("NR desactivado. Puedes activarlo durante la partida.");
++    else if(NativeNrControl::progress.load()==3)ImGui::TextWrapped("NR encontro un error. Consulta OptiScaler.log.");
++    else if(NativeNrControl::progress.load()==2)ImGui::TextUnformatted("NR: pase enviado en este Present.");
++    else ImGui::TextUnformatted("NR solicitado: preparando el modelo cuando haya una salida compatible.");
++    if(enabled&&NativeNrControl::temporalRequested.load()){
++        if(NativeNrControl::temporalApplied.load())ImGui::TextUnformatted("Temporal aplicado al pase NR.");
++        else if(NativeNrControl::temporalProgress.load()==2)ImGui::TextUnformatted("Temporal: movimiento y profundidad recibidos.");
++        else if(NativeNrControl::temporalProgress.load()==1)ImGui::TextUnformatted("Temporal: preparando historial; NR conserva la ruta anterior.");
++        else ImGui::TextWrapped("Temporal no aplicado: NR usa la ruta anterior. Consulta OptiScaler.log.");
++    }
++#ifdef NR_GAME_GLOBAL_B1
++#ifdef NR_GAME_MODES
++    ImGui::TextWrapped("Un pase sincrono, temporal y filtro de bordes. El modo elegido dura solo esta partida.");
++#elif defined(NR_GAME_COMPACT320)
++    ImGui::TextWrapped("PRUEBA compacta: 320x180, un pase sincrono, temporal y EdgeGuidedResidual sobre SDR nativo.");
++#elif defined(NR_GAME_COMPACT512)
++    ImGui::TextWrapped("PRUEBA compacta: 512x288, un pase sincrono y EdgeGuidedResidual sobre SDR nativo.");
++#else
++    ImGui::TextWrapped("Global B1: 640x360, un pase y residual sobre SDR nativo. El cambio dura solo esta partida.");
++#endif
++#else
++    ImGui::TextWrapped("El modo detalle es muy lento. El cambio dura solo esta partida.");
++#endif
++}
+diff --git a/OptiScaler/experimental/NativeNrHook.h b/OptiScaler/experimental/NativeNrHook.h
+new file mode 100644
+index 0000000..612706a
+--- /dev/null
++++ b/OptiScaler/experimental/NativeNrHook.h
+@@ -0,0 +1,101 @@
++#pragma once
++#include <d3d12.h>
++#include <nvsdk_ngx_params.h>
++#include <atomic>
++#include <memory>
++#include <mutex>
++#include <map>
++#include <stdexcept>
++#include "NativeNrLifecycle.h"
++
++// Experimental post-upscale callback. Registration/initialization must finish
++// outside Evaluate; the immutable binding and GPU objects live through the fence.
++namespace NativeNrHook {
++enum class Result { Skipped, Recorded, Failed };
++struct Binding {
++    unsigned handleId,width,height;
++    DXGI_FORMAT format;
++    ID3D12Resource* output;
++    void* user;
++    bool (*record)(void*,ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
++    std::shared_ptr<void> owner;
++    bool (*ready)(void*)=nullptr;
++    bool allowCompatibleRotation=false;
++};
++inline std::atomic<const Binding*> active{nullptr};
++inline std::mutex bindingsMutex;
++inline std::map<unsigned,std::shared_ptr<const Binding>> bindings;
++inline void Register(const Binding* binding){active.store(binding,std::memory_order_release);}
++inline void RegisterOwned(std::shared_ptr<const Binding> binding){
++    if(!binding)return;std::lock_guard<std::mutex> lock(bindingsMutex);
++    if(bindings.count(binding->handleId))throw std::runtime_error("Duplicate owned NR binding");
++    bindings.emplace(binding->handleId,std::move(binding));
++}
++inline void Unregister(unsigned handle){std::lock_guard<std::mutex> lock(bindingsMutex);bindings.erase(handle);}
++inline ID3D12Resource* GetOutput(const NVSDK_NGX_Parameter* params){
++    if(!params)return nullptr;ID3D12Resource* output=nullptr;
++    if(params->Get(NVSDK_NGX_Parameter_Output,&output)==NVSDK_NGX_Result_Success)return output;
++    void* pointer=nullptr;if(params->Get(NVSDK_NGX_Parameter_Output,&pointer)!=NVSDK_NGX_Result_Success)return nullptr;
++    return static_cast<ID3D12Resource*>(pointer);
++}
++inline ID3D12Resource* GetResource(const NVSDK_NGX_Parameter* params,const char* key){
++    ID3D12Resource* resource=nullptr;if(params->Get(key,&resource)==NVSDK_NGX_Result_Success)return resource;
++    void* pointer=nullptr;if(params->Get(key,&pointer)!=NVSDK_NGX_Result_Success)return nullptr;return static_cast<ID3D12Resource*>(pointer);
++}
++inline NativeNrTemporal::FrameInput ReadFrameInputs(unsigned handle,UINT64 frame,const NVSDK_NGX_Parameter* params,unsigned flags){
++    NativeNrTemporal::FrameInput f{};f.handle=handle;f.featureFrame=frame;if(!params)return f;
++    f.colour.resource=GetResource(params,NVSDK_NGX_Parameter_Color);f.depth.resource=GetResource(params,NVSDK_NGX_Parameter_Depth);
++    f.motion.resource=GetResource(params,NVSDK_NGX_Parameter_MotionVectors);f.output.resource=GetOutput(params);
++    params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,&f.renderWidth);
++    params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,&f.renderHeight);
++    params->Get("FSR.upscaleSize.width",&f.displayWidth);params->Get("FSR.upscaleSize.height",&f.displayHeight);
++    f.scalesKnown=params->Get(NVSDK_NGX_Parameter_MV_Scale_X,&f.motionScaleX)==NVSDK_NGX_Result_Success;
++    f.scalesKnown=(params->Get(NVSDK_NGX_Parameter_MV_Scale_Y,&f.motionScaleY)==NVSDK_NGX_Result_Success)&&f.scalesKnown;
++    f.jitterKnown=params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X,&f.jitterX)==NVSDK_NGX_Result_Success;
++    f.jitterKnown=(params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y,&f.jitterY)==NVSDK_NGX_Result_Success)&&f.jitterKnown;
++    unsigned reset=0;params->Get(NVSDK_NGX_Parameter_Reset,&reset);f.reset=reset!=0;
++    f.cameraRangeKnown=params->Get("FSR.cameraNear",&f.cameraNear)==NVSDK_NGX_Result_Success;
++    f.cameraRangeKnown=(params->Get("FSR.cameraFar",&f.cameraFar)==NVSDK_NGX_Result_Success)&&f.cameraRangeKnown&&std::isfinite(f.cameraNear)&&std::isfinite(f.cameraFar)&&f.cameraNear>0&&f.cameraFar>f.cameraNear;
++    // Only explicit FFX-dispatch states are accepted here, not backend guesses.
++    auto state=[&](const char* known,const char* key,NativeNrTemporal::ResourceView& view){unsigned valid=0,value=0;
++        if(params->Get(known,&valid)==NVSDK_NGX_Result_Success&&valid&&params->Get(key,&value)==NVSDK_NGX_Result_Success){view.state=static_cast<D3D12_RESOURCE_STATES>(value);view.stateKnown=true;}};
++    state("NR.MotionStateKnown","NR.MotionState",f.motion);state("NR.DepthStateKnown","NR.DepthState",f.depth);
++    state("NR.ReactiveStateKnown","NR.ReactiveState",f.reactive);
++    if(f.reactive.stateKnown)f.reactive.resource=GetResource(params,"FSR.reactive");
++    f.lowResolutionMotion=(flags&NVSDK_NGX_DLSS_Feature_Flags_MVLowRes)!=0;
++    f.jitteredMotion=(flags&NVSDK_NGX_DLSS_Feature_Flags_MVJittered)!=0;
++    f.invertedDepth=(flags&NVSDK_NGX_DLSS_Feature_Flags_DepthInverted)!=0;
++    // Declared FFX API convention, matching the bundled FSR3 backend's normalization.
++    // Live quality still needs validation; unknown APIs cannot enable this path.
++    unsigned ffxContract=0;params->Get("NR.FfxMotionContract",&ffxContract);
++    if(ffxContract==1){f.motionConventionVerified=true;f.motionReferenceWidth=f.lowResolutionMotion?f.renderWidth:f.displayWidth;f.motionReferenceHeight=f.lowResolutionMotion?f.renderHeight:f.displayHeight;}
++    return f;
++}
++inline Result Evaluate(unsigned handle,ID3D12GraphicsCommandList* list,const NVSDK_NGX_Parameter* params,
++                       bool hdr,bool knownState,D3D12_RESOURCE_STATES outputState){
++    std::shared_ptr<const Binding> retained;
++    {std::lock_guard<std::mutex> lock(bindingsMutex);auto found=bindings.find(handle);if(found!=bindings.end())retained=found->second;}
++    const Binding* binding=retained?retained.get():active.load(std::memory_order_acquire);
++    if(hdr||!knownState)return Result::Skipped;
++    if(!binding||handle!=binding->handleId){
++        if(list&&list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT)if(auto output=GetOutput(params))NativeNrLifecycle::Observe(handle,output);
++        return Result::Skipped;
++    }
++    if(!list||!params||!binding->record||!binding->output)return Result::Failed;
++    ID3D12Resource* output=GetOutput(params);
++    if(output!=binding->output&&!binding->allowCompatibleRotation){
++        if(output&&list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT)NativeNrLifecycle::Observe(handle,output);
++        return Result::Skipped; // Worker retires/rebuilds; never change descriptors on an outstanding list.
++    }
++    if(binding->ready&&!binding->ready(binding->user))return Result::Skipped;
++    auto desc=output->GetDesc();
++    if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||desc.Width!=binding->width||desc.Height!=binding->height||desc.Format!=binding->format||desc.MipLevels!=1||desc.DepthOrArraySize!=1||desc.SampleDesc.Count!=1){
++        if(binding->allowCompatibleRotation&&list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT)NativeNrLifecycle::Observe(handle,output);
++        return Result::Skipped;
++    }
++    if(!binding->record(binding->user,list,output,outputState))return Result::Failed;
++    // A failed observer must retain the registered session: GPU commands have
++    // already been recorded. Do not release it or replay to recover here.
++    return NativeNrLifecycle::Recorded(handle,list)?Result::Recorded:Result::Failed;
++}
++}
+diff --git a/OptiScaler/experimental/NativeNrLifecycle.h b/OptiScaler/experimental/NativeNrLifecycle.h
+new file mode 100644
+index 0000000..6263a47
+--- /dev/null
++++ b/OptiScaler/experimental/NativeNrLifecycle.h
+@@ -0,0 +1,61 @@
++#pragma once
++#include <d3d12.h>
++#include <memory>
++#include <mutex>
++#include "NativeNrFrameInput.h"
++
++// Disabled experimental boundary. Provider owns its controller and serializes
++// record/submit/reset/retire; callbacks must retain GPU objects on any failure.
++namespace NativeNrLifecycle {
++using Forward = void (*)(void*);
++struct Provider {
++    std::shared_ptr<void> owner;
++    void* user=nullptr;
++    bool (*execute)(void*,ID3D12CommandQueue*,UINT,ID3D12CommandList* const*,Forward,void*)=nullptr;
++    bool (*recorded)(void*,unsigned,ID3D12GraphicsCommandList*)=nullptr;
++    void (*reset)(void*,ID3D12GraphicsCommandList*)=nullptr;
++    void (*retire)(void*,unsigned)=nullptr;
++    void (*shutdown)(void*)=nullptr; // Request retirement; not proof of GPU completion.
++    void (*observe)(void*,unsigned,ID3D12Resource*)=nullptr; // Metadata only; no preparation here.
++    // Optional temporal capture before the upscaler consumes/reuses engine inputs.
++    // An absent/failed temporal observer must never fail the game's upscaler.
++    bool (*frameInputs)(void*,ID3D12GraphicsCommandList*,const NativeNrTemporal::FrameInput&)=nullptr;
++};
++inline std::mutex mutex;
++inline std::shared_ptr<const Provider> provider;
++inline void Register(std::shared_ptr<const Provider> value){std::lock_guard<std::mutex> lock(mutex);provider=std::move(value);}
++inline std::shared_ptr<const Provider> Snapshot(){std::lock_guard<std::mutex> lock(mutex);return provider;}
++// Forward the game's call exactly once even when the provider fails before or
++// after Execute. Never replay the list to recover from a missing NR marker.
++inline bool Execute(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists,Forward original,void* user) noexcept {
++    if(!original)return false;
++    struct Call {Forward original;void* user;bool called=false,duplicate=false;} call{original,user};
++    auto once=[](void* pointer){auto& value=*static_cast<Call*>(pointer);
++        if(value.called){value.duplicate=true;return;}value.called=true;value.original(value.user);};
++    bool success=true;
++    try{auto value=Snapshot();if(value&&value->execute)success=value->execute(value->user,queue,count,lists,once,&call);}
++    catch(...){success=false;}
++    if(!call.called){try{once(&call);}catch(...){success=false;}}
++    return success&&!call.duplicate;
++}
++inline bool Reset(ID3D12GraphicsCommandList* list,HRESULT result) noexcept {
++    if(FAILED(result))return true;
++    try{auto value=Snapshot();if(value&&value->reset)value->reset(value->user,list);return true;}catch(...){return false;}
++}
++inline bool Recorded(unsigned handle,ID3D12GraphicsCommandList* list) noexcept {
++    try{auto value=Snapshot();return !value||!value->recorded||value->recorded(value->user,handle,list);}catch(...){return false;}
++}
++inline bool Retire(unsigned handle) noexcept {
++    try{auto value=Snapshot();if(value&&value->retire)value->retire(value->user,handle);return true;}catch(...){return false;}
++}
++inline bool Shutdown() noexcept {
++    try{auto value=Snapshot();if(value&&value->shutdown)value->shutdown(value->user);return true;}catch(...){return false;}
++}
++inline bool Observe(unsigned handle,ID3D12Resource* output) noexcept {
++    try{auto value=Snapshot();if(value&&value->observe)value->observe(value->user,handle,output);return true;}catch(...){return false;}
++}
++inline bool FrameInputs(ID3D12GraphicsCommandList* list,const NativeNrTemporal::FrameInput& input) noexcept {
++    if(!list||list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT)return false;
++    try{auto value=Snapshot();return value&&value->frameInputs&&value->frameInputs(value->user,list,input);}catch(...){return false;}
++}
++}
+diff --git a/OptiScaler/experimental/NativeNrQueueHook.h b/OptiScaler/experimental/NativeNrQueueHook.h
+new file mode 100644
+index 0000000..d63097e
+--- /dev/null
++++ b/OptiScaler/experimental/NativeNrQueueHook.h
+@@ -0,0 +1,39 @@
++#pragma once
++#include "NativeNrLifecycle.h"
++#include <detours/detours.h>
++#include <atomic>
++
++// Installation/removal require quiescent caller threads. This experiment only
++// covers the captured DIRECT queue implementation; do not enable NR on another
++// implementation or queue without installing and validating its observer.
++class NativeNrQueueHook {
++    using ExecuteFn=void (STDMETHODCALLTYPE*)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
++    inline static ExecuteFn original=nullptr;
++    inline static PVOID target=nullptr;
++    inline static std::mutex mutex;
++    inline static std::atomic<UINT64> failures{0};
++    static void STDMETHODCALLTYPE Execute(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
++        struct Call {ID3D12CommandQueue* queue;UINT count;ID3D12CommandList* const* lists;} call{queue,count,lists};
++        if(!NativeNrLifecycle::Execute(queue,count,lists,[](void* user){auto& args=*static_cast<Call*>(user);original(args.queue,args.count,args.lists);},&call))++failures;
++    }
++public:
++    static bool Install(ID3D12CommandQueue* queue){
++        if(!queue||queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return false;
++        std::lock_guard<std::mutex> lock(mutex);auto address=(*(PVOID**)queue)[10];
++        if(original)return address==target;
++        original=reinterpret_cast<ExecuteFn>(address);
++        if(DetourTransactionBegin()!=NO_ERROR){original=nullptr;return false;}
++        if(DetourUpdateThread(GetCurrentThread())!=NO_ERROR||DetourAttach(&(PVOID&)original,Execute)!=NO_ERROR){
++            DetourTransactionAbort();original=nullptr;return false;}
++        if(DetourTransactionCommit()!=NO_ERROR){original=nullptr;return false;}
++        target=address;return true;
++    }
++    static bool Remove(){
++        std::lock_guard<std::mutex> lock(mutex);if(!original)return true;
++        if(DetourTransactionBegin()!=NO_ERROR)return false;
++        if(DetourUpdateThread(GetCurrentThread())!=NO_ERROR||DetourDetach(&(PVOID&)original,Execute)!=NO_ERROR){DetourTransactionAbort();return false;}
++        if(DetourTransactionCommit()!=NO_ERROR)return false;
++        original=nullptr;target=nullptr;return true;
++    }
++    static UINT64 FailureCount(){return failures.load();}
++};
+diff --git a/OptiScaler/hooks/D3D12_Hooks.cpp b/OptiScaler/hooks/D3D12_Hooks.cpp
+index 9366fa7..13a18eb 100644
+--- a/OptiScaler/hooks/D3D12_Hooks.cpp
++++ b/OptiScaler/hooks/D3D12_Hooks.cpp
+@@ -1,5 +1,15 @@
+ #include "pch.h"
+ #include "D3D12_Hooks.h"
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++#include "experimental/NativeNrLifecycle.h"
++#include "experimental/NativeNrQueueHook.h"
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++#include "NativeNrApi.h"
++#ifdef NR_GAME_GLOBAL_B1
++#include "NativeNrRuntime.h"
++#endif
++#endif
++#endif
+ 
+ #include <Util.h>
+ #include <Config.h>
+@@ -65,6 +75,18 @@ static D3d12Proxy::PFN_D3D12SerializeVersionedRootSignature o_D3D12SerializeVers
+ static PFN_Release o_D3D12DeviceRelease = nullptr;
+ 
+ static bool _creatingD3D12Device = false;
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++bool D3D12Hooks::HookCommandQueue(ID3D12CommandQueue* queue) {
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++    auto result=OptiScalerNR_ConfigureQueue(queue);
++    if(FAILED(result))LOG_ERROR("Native NR configured queue rejected: {:X}",static_cast<unsigned>(result));
++    return SUCCEEDED(result);
++#else
++    return NativeNrQueueHook::Install(queue);
++#endif
++}
++bool D3D12Hooks::UnhookCommandQueue() { return NativeNrQueueHook::Remove(); }
++#endif
+ static bool _d3d12Captured = false;
+ static LUID _lastAdapterLuid = {};
+ 
+@@ -564,6 +586,10 @@ static HRESULT hkReset(ID3D12GraphicsCommandList* commandList, ID3D12CommandAllo
+                        ID3D12PipelineState* pInitialState)
+ {
+     auto result = s_Reset.o_earlyHook(commandList, pAllocator, pInitialState);
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    if (!t_suppressRecording && !NativeNrLifecycle::Reset(commandList,result))
++        LOG_ERROR("Native NR reset observer failed; owners retained");
++#endif
+ 
+     if (SUCCEEDED(result))
+         RecordReset(commandList, pInitialState);
+@@ -713,6 +739,10 @@ static HRESULT hkResetLate(ID3D12GraphicsCommandList* commandList, ID3D12Command
+         SuppressRecordingScope suppress;
+         result = s_Reset.o_lateHook(commandList, pAllocator, pInitialState);
+     }
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    if (!t_suppressRecording && !NativeNrLifecycle::Reset(commandList,result))
++        LOG_ERROR("Native NR late reset observer failed; owners retained");
++#endif
+ 
+     if (SUCCEEDED(result))
+         RecordReset(commandList, pInitialState);
+@@ -930,6 +960,7 @@ struct CmdListHookConfig
+     bool restoreGraphics;
+     bool extended;
+     bool hookDescriptorHeaps;
++    bool hookReset;
+ 
+     static CmdListHookConfig Get()
+     {
+@@ -937,6 +968,10 @@ struct CmdListHookConfig
+         CmdListHookConfig c {};
+         c.restoreCompute = config->RestoreComputeSignature.value_or_default();
+         c.restoreGraphics = config->RestoreGraphicSignature.value_or_default();
++        c.hookReset = c.restoreCompute || c.restoreGraphics;
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++        c.hookReset = true;
++#endif
+         c.extended = config->ExtendedStateRestore.value_or_default();
+         c.hookDescriptorHeaps = c.extended || (config->FGHudfixPersistentBindings.value_or_default() &&
+                                                State::Instance().activeFgInput == FGInput::Upscaler);
+@@ -967,7 +1002,7 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
+     DetourUpdateThread(GetCurrentThread());
+ 
+     // Common
+-    AttachIf(c.restoreCompute || c.restoreGraphics, s_Reset.o_lateHook, hkResetLate);
++    AttachIf(c.hookReset, s_Reset.o_lateHook, hkResetLate);
+     AttachIf(c.extended, s_SetPipelineState.o_lateHook, hkSetPipelineStateLate);
+     AttachIf(c.hookDescriptorHeaps, s_SetDescriptorHeaps.o_lateHook, hkSetDescriptorHeapsLate);
+ 
+@@ -1024,7 +1059,7 @@ static void HookToCommandList(ID3D12Device* InDevice)
+         DetourUpdateThread(GetCurrentThread());
+ 
+         // Common
+-        AttachIf(c.restoreCompute || c.restoreGraphics, s_Reset.o_earlyHook, hkReset);
++        AttachIf(c.hookReset, s_Reset.o_earlyHook, hkReset);
+         AttachIf(c.extended, s_SetPipelineState.o_earlyHook, hkSetPipelineState);
+         AttachIf(c.hookDescriptorHeaps, s_SetDescriptorHeaps.o_earlyHook, hkSetDescriptorHeaps);
+ 
+@@ -1435,6 +1470,17 @@ VALIDATE_HOOK(hkD3D12CreateDevice, D3d12Proxy::PFN_D3D12CreateDevice)
+ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
+                                    void** ppDevice)
+ {
++#ifdef NR_GAME_GLOBAL_B1
++    auto createDevice=[&](IUnknown* adapter,D3D_FEATURE_LEVEL level,REFIID iid,void** output){
++        HRESULT value;
++        if(NativeNrCreateDevice(adapter,level,iid,output,&value)){
++            LOG_INFO("Native NR SDK721 factory device request: result=0x{:08X}",UINT(value));return value;
++        }
++        return o_D3D12CreateDevice(adapter,level,iid,output);
++    };
++#else
++    auto createDevice=o_D3D12CreateDevice;
++#endif
+     LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
+               Util::WhoIsTheCaller(_ReturnAddress()));
+ 
+@@ -1451,6 +1497,11 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
+ 
+         debugController->Release();
+     }
++#endif
++#ifdef NR_GAME_GLOBAL_B1
++    auto nrRuntime=NativeNrInitializeRuntime();
++    if(FAILED(nrRuntime))LOG_ERROR("Native NR early SDK721 initialization failed: 0x{:08X}. Global graph will fail closed.",UINT(nrRuntime));
++    else if(nrRuntime==S_OK)LOG_INFO("Native NR SDK721 private factory configured; global game SDK preserved");
+ #endif
+     IdentifyGpu::updateD3d12Capabilities(o_D3D12CreateDevice);
+ 
+@@ -1488,7 +1539,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
+ 
+         _creatingD3D12Device = true;
+         ScopedCreatingD3DDevice skipCreatingD3DDevice {};
+-        auto result = o_D3D12CreateDevice(pAdapter, minLevel, riid, ppDevice);
++        auto result = createDevice(pAdapter, minLevel, riid, ppDevice);
+         _creatingD3D12Device = false;
+ 
+         return result;
+@@ -1499,12 +1550,12 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
+     if (desc.VendorId == VendorId::Intel)
+     {
+         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
+-        result = o_D3D12CreateDevice(pAdapter, minLevel, riid, ppDevice);
++        result = createDevice(pAdapter, minLevel, riid, ppDevice);
+     }
+     else
+     {
+         ScopedCreatingD3DDevice skipCreatingD3DDevice {};
+-        result = o_D3D12CreateDevice(pAdapter, minLevel, riid, ppDevice);
++        result = createDevice(pAdapter, minLevel, riid, ppDevice);
+     }
+     _creatingD3D12Device = false;
+ 
+@@ -1590,13 +1641,24 @@ VALIDATE_HOOK(hkCreateDevice, PFN_CreateDevice)
+ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel,
+                               REFIID riid, void** ppDevice)
+ {
++#ifdef NR_GAME_GLOBAL_B1
++    auto createDevice=[&](ID3D12DeviceFactory* factory,IUnknown* adapter,D3D_FEATURE_LEVEL level,REFIID iid,void** output){
++        HRESULT value;
++        if(NativeNrCreateDevice(adapter,level,iid,output,&value)){
++            LOG_INFO("Native NR SDK721 factory COM request: result=0x{:08X}",UINT(value));return value;
++        }
++        return o_CreateDevice(factory,adapter,level,iid,output);
++    };
++#else
++    auto createDevice=o_CreateDevice;
++#endif
+     LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
+               Util::WhoIsTheCaller(_ReturnAddress()));
+ 
+     if (_creatingD3D12Device)
+     {
+         LOG_DEBUG("Calling from hkD3D12CreateDevice, calling original CreateDevice");
+-        return o_CreateDevice(pFactory, pAdapter, MinimumFeatureLevel, riid, ppDevice);
++        return createDevice(pFactory, pAdapter, MinimumFeatureLevel, riid, ppDevice);
+     }
+ 
+ #ifdef ENABLE_DEBUG_LAYER_DX12
+@@ -1642,7 +1704,7 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
+     {
+         LOG_ERROR("ppDevice is nullptr");
+         ScopedCreatingD3DDevice skipCreatingD3DDevice {};
+-        return o_CreateDevice(pFactory, pAdapter, minLevel, riid, ppDevice);
++        return createDevice(pFactory, pAdapter, minLevel, riid, ppDevice);
+     }
+ 
+     HRESULT result;
+@@ -1650,12 +1712,12 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
+     {
+         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
+         ScopedCreatingD3DDevice skipCreatingD3DDevice {};
+-        result = o_CreateDevice(pFactory, pAdapter, minLevel, riid, ppDevice);
++        result = createDevice(pFactory, pAdapter, minLevel, riid, ppDevice);
+     }
+     else
+     {
+         ScopedCreatingD3DDevice skipCreatingD3DDevice {};
+-        result = o_CreateDevice(pFactory, pAdapter, minLevel, riid, ppDevice);
++        result = createDevice(pFactory, pAdapter, minLevel, riid, ppDevice);
+     }
+ 
+     LOG_DEBUG("o_D3D12CreateDevice result: {:X}", (UINT) result);
+diff --git a/OptiScaler/hooks/D3D12_Hooks.h b/OptiScaler/hooks/D3D12_Hooks.h
+index aea357c..2a525ec 100644
+--- a/OptiScaler/hooks/D3D12_Hooks.h
++++ b/OptiScaler/hooks/D3D12_Hooks.h
+@@ -12,6 +12,10 @@ class D3D12Hooks
+     static void Hook();
+     static void HookAgility(HMODULE module);
+     static void HookDevice(ID3D12Device* device);
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    static bool HookCommandQueue(ID3D12CommandQueue* queue);
++    static bool UnhookCommandQueue();
++#endif
+     static void Unhook();
+ 
+     // Enables/disables command list state recording for the CALLING THREAD.
+diff --git a/OptiScaler/inputs/FfxApiExe_Dx12.cpp b/OptiScaler/inputs/FfxApiExe_Dx12.cpp
+index e6a1592..af56613 100644
+--- a/OptiScaler/inputs/FfxApiExe_Dx12.cpp
++++ b/OptiScaler/inputs/FfxApiExe_Dx12.cpp
+@@ -14,6 +14,9 @@
+ #include "ffx_upscale.h"
+ #include "dx12/ffx_api_dx12.h"
+ #include "FfxApiExe_Dx12.h"
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++#include "experimental/NativeNrFfxBridge.h"
++#endif
+ 
+ inline static PfnFfxCreateContext _D3D12_CreateContext = nullptr;
+ inline static PfnFfxDestroyContext _D3D12_DestroyContext = nullptr;
+@@ -380,6 +383,9 @@ static ffxReturnCode_t ffxDispatch_Dx12(ffxContext* context, ffxDispatchDescHead
+     params->Set(NVSDK_NGX_Parameter_Sharpness, dispatchDesc->sharpness);
+     params->Set("FSR.upscaleSize.width", dispatchDesc->upscaleSize.width);
+     params->Set("FSR.upscaleSize.height", dispatchDesc->upscaleSize.height);
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    NativeNrPublishFfxMetadata(params,*dispatchDesc);
++#endif
+ 
+     LOG_DEBUG("handle: {:X}, internalResolution: {}x{}", handle->Id, dispatchDesc->renderSize.width,
+               dispatchDesc->renderSize.height);
+diff --git a/OptiScaler/inputs/FfxApi_Dx12.cpp b/OptiScaler/inputs/FfxApi_Dx12.cpp
+index 772267d..96ceac9 100644
+--- a/OptiScaler/inputs/FfxApi_Dx12.cpp
++++ b/OptiScaler/inputs/FfxApi_Dx12.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include "Util.h"
+ #include "Config.h"
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++#include "experimental/NativeNrFfxBridge.h"
++#endif
+ 
+ #include "resource.h"
+ #include "NVNGX_Parameter.h"
+@@ -652,6 +655,11 @@ ffxReturnCode_t ffxDispatch_Dx12(ffxContext* context, ffxDispatchDescHeader* des
+     params->Set(NVSDK_NGX_Parameter_Sharpness, dispatchDesc->sharpness);
+     params->Set("FSR.upscaleSize.width", dispatchDesc->upscaleSize.width);
+     params->Set("FSR.upscaleSize.height", dispatchDesc->upscaleSize.height);
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    // Carry the engine's explicit states into the pre-Evaluate temporal observer.
++    // Refresh known flags on every dispatch; stale metadata must not survive reset.
++    NativeNrPublishFfxMetadata(params,*dispatchDesc);
++#endif
+ 
+     LOG_DEBUG("handle: {:X}, internalResolution: {}x{}", handle->Id, dispatchDesc->renderSize.width,
+               dispatchDesc->renderSize.height);
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 3935cf3..84e146b 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -1,6 +1,14 @@
+ #include "pch.h"
+ #include "Util.h"
+ #include "Config.h"
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++#include "experimental/NativeNrHook.h"
++#include "experimental/NativeNrControl.h"
++#include "experimental/NativeNrLifecycle.h"
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++#include "NativeNrApi.h"
++#endif
++#endif
+ 
+ #include "NVNGX_DLSS.h"
+ #include "NVNGX_Parameter.h"
+@@ -368,6 +376,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_with_ProjectID(
+ 
+ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown(void)
+ {
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    if (!NativeNrLifecycle::Shutdown())
++        LOG_ERROR("Native NR shutdown observer failed; pending owners must remain retained");
++#endif
+     shutdown = true;
+     State::Instance().nvngxDx12Inited = false;
+ 
+@@ -820,6 +832,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle*
+         return NVSDK_NGX_Result_Success;
+ 
+     auto handleId = InHandle->Id;
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    if (!NativeNrLifecycle::Retire(handleId))
++        LOG_ERROR("Native NR release observer failed for handle {}",handleId);
++#endif
+ 
+     // Clean up framegen
+     if (State::Instance().currentFG != nullptr && State::Instance().activeFgInput == FGInput::Upscaler)
+@@ -1051,6 +1067,16 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+     state.currentFeature = feature;
+ 
+     // Prepare upscaling inputs
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++    // Inputs are borrowed only for this callback. A temporal provider must record
++    // GPU snapshots here, before the upscaler or UpscaleStart changes/reuses them.
++    const auto nrFrameInputs=NativeNrHook::ReadFrameInputs(handleId,UINT64(feature->FrameCount()),InParameters,feature->GetFeatureFlags());
++    {ScopedSkipHeapCapture nrCaptureScope {};
++        const bool nrAccepted=NativeNrLifecycle::FrameInputs(InCmdList,nrFrameInputs);
++        if(!nrAccepted&&NativeNrIsEnabled()&&(nrFrameInputs.featureFrame<6||nrFrameInputs.featureFrame%120==0))
++            LOG_WARN("Native NR pre-upscale observer rejected: feature={}, frame={}, commandType={}, snapshot={}, convention={}, render={}x{}, display={}x{}",handleId,nrFrameInputs.featureFrame,UINT(InCmdList->GetType()),NativeNrTemporal::CanSnapshot(nrFrameInputs),nrFrameInputs.motionConventionVerified,nrFrameInputs.renderWidth,nrFrameInputs.renderHeight,nrFrameInputs.displayWidth,nrFrameInputs.displayHeight);
++    }
++#endif
+     UpscalerInputsDx12::UpscaleStart(InCmdList, InParameters, feature);
+     FSR3FG::SetUpscalerInputs(InCmdList, InParameters, feature);
+ 
+@@ -1060,6 +1086,45 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+         ScopedSkipHeapCapture skip {};
+         evalSuccess = feature->Evaluate(InCmdList, InParameters);
+ 
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++        if(!NativeNrUsesPresentSdr()) {
++#endif
++        // Observe Output here; the queue observer schedules worker preparation.
++        // Once ready, record the resident model before UpscaleEnd on this DIRECT list.
++        // Require an explicit backend-restored output state, never guess it.
++        if (evalSuccess && cfg.OutputResourceBarrier.has_value())
++        {
++            const auto nrResult = NativeNrHook::Evaluate(
++                handleId, InCmdList, InParameters,
++                (feature->GetFeatureFlags() & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0,
++                true, static_cast<D3D12_RESOURCE_STATES>(cfg.OutputResourceBarrier.value()));
++            static thread_local unsigned nrLastLoggedHandle = ~0u;
++            static thread_local NativeNrHook::Result nrLastLoggedResult = NativeNrHook::Result::Failed;
++            if (nrLastLoggedHandle != handleId || nrResult == NativeNrHook::Result::Failed ||
++                (nrResult == NativeNrHook::Result::Recorded && nrLastLoggedResult != nrResult))
++            {
++                LOG_INFO("Native NR post-upscale: handle={}, result={} (0=skipped, 1=recorded, 2=failed)",handleId,static_cast<unsigned>(nrResult));
++                nrLastLoggedHandle=handleId;nrLastLoggedResult=nrResult;
++            }
++            if ((feature->GetFeatureFlags() & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0)
++            {
++                static thread_local bool nrHdrLogged=false;
++                if(!nrHdrLogged){LOG_WARN("Native NR skipped: feature reports HDR; current game proxy requires SDR tensors even if display HDR is off");nrHdrLogged=true;}
++            }
++            if (nrResult == NativeNrHook::Result::Failed)
++                evalSuccess = false;
++        }
++        else if (evalSuccess)
++        {
++            static thread_local bool nrStateLogged=false;
++            if(!nrStateLogged){LOG_WARN("Native NR skipped: OutputResourceBarrier not supplied by backend; resource state will not be guessed");nrStateLogged=true;}
++        }
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++        }
++#endif
++#endif
++
+         // Resource tracking
+         UpscalerInputsDx12::UpscaleEnd(InCmdList, InParameters, feature);
+     }
+diff --git a/OptiScaler/menu/menu_common.cpp b/OptiScaler/menu/menu_common.cpp
+index e1dfcf2..0a54f3d 100644
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -1,5 +1,8 @@
+ #include "pch.h"
+ #include "menu_common.h"
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++#include <experimental/NativeNrControl.h>
++#endif
+ 
+ #include "input/input_system.h"
+ 
+@@ -8401,6 +8404,10 @@ void MenuCommon::RenderMainMenuTabs(RenderMenuContext& ctx)
+         ImGui::PushID(selectedMenuTab);
+         ImGui::BeginChild("##MenuTabBody", ImVec2(0.0f, 0.0f));
+ 
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++        if(selectedMenuTab==0||strcmp(tab.label,"Upscaling")==0)RenderNativeNrControl();
++#endif
++
+         if (tab.draw != nullptr)
+             tab.draw(ctx);
+ 
+diff --git a/OptiScaler/menu/menu_overlay_dx.cpp b/OptiScaler/menu/menu_overlay_dx.cpp
+index 72c43a0..3e0e702 100644
+--- a/OptiScaler/menu/menu_overlay_dx.cpp
++++ b/OptiScaler/menu/menu_overlay_dx.cpp
+@@ -5,6 +5,9 @@
+ #include <Util.h>
+ #include <Logger.h>
+ #include <Config.h>
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR)
++#include <hooks/D3D12_Hooks.h>
++#endif
+ 
+ #include <imgui/imgui_impl_dx11.h>
+ #include <imgui/imgui_impl_dx12.h>
+@@ -616,6 +619,10 @@ void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
+ 
+         if (!CheckForRealObject(__FUNCTION__, pDevice, &currentSCCommandQueue))
+             currentSCCommandQueue = pDevice;
++#if defined(OPTISCALER_EXPERIMENTAL_NATIVE_NR) && !defined(OPTISCALER_NATIVE_NR_MODEL)
++        if (!D3D12Hooks::HookCommandQueue((ID3D12CommandQueue*)currentSCCommandQueue))
++            LOG_ERROR("Native NR could not hook captured queue; keep NR bindings disabled");
++#endif
+ 
+         if (((ID3D12CommandQueue*) currentSCCommandQueue)->GetDevice(IID_PPV_ARGS(&device12)) == S_OK)
+         {
+diff --git a/OptiScaler/misc/IdentifyGpu.cpp b/OptiScaler/misc/IdentifyGpu.cpp
+index 144d775..cc5de69 100644
+--- a/OptiScaler/misc/IdentifyGpu.cpp
++++ b/OptiScaler/misc/IdentifyGpu.cpp
+@@ -1,5 +1,8 @@
+ #include "pch.h"
+ #include "IdentifyGpu.h"
++#ifdef NR_GAME_GLOBAL_B1
++#include "NativeNrRuntime.h"
++#endif
+ 
+ #include <magic_enum.hpp>
+ #include <include/device_info/device_info.hpp>
+@@ -393,6 +396,11 @@ void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3
+         return;
+ 
+     D3d12Proxy::Init(d3d12Module);
++#ifdef NR_GAME_GLOBAL_B1
++    // This diagnostic path can create a device without going through the hook.
++    auto nrRuntime=NativeNrInitializeRuntime();
++    if(FAILED(nrRuntime))LOG_ERROR("Native NR early runtime configuration failed: 0x{:08X}",UINT(nrRuntime));
++#endif
+ 
+     {
+         std::scoped_lock lock(mutex);
+diff --git a/OptiScaler/wrapped/wrapped_swapchain.cpp b/OptiScaler/wrapped/wrapped_swapchain.cpp
+index 2807e2e..ac728e0 100644
+--- a/OptiScaler/wrapped/wrapped_swapchain.cpp
++++ b/OptiScaler/wrapped/wrapped_swapchain.cpp
+@@ -7,6 +7,9 @@
+ #include <nvapi/fakenvapi.h>
+ #include <hooks/Reflex_Hooks.h>
+ #include <hooks/D3D12_Hooks.h>
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++#include "NativeNrApi.h"
++#endif
+ #include <with_dx12/dx11_with_dx12_sync.h>
+ 
+ #include <menu/menu_overlay_dx.h>
+@@ -187,7 +190,7 @@ static void WaitForGPUIdle(IUnknown* object)
+         queue->Release();
+     }
+ 
+-    if (queue != nullptr && resizeFence != nullptr && resizeFenceEvent != nullptr)
++    if (queue != nullptr)
+     {
+         if (State::Instance().currentD3D12Device != nullptr)
+         {
+@@ -471,6 +474,15 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
+                 currentFeature->TickFrozenCheck();
+         }
+ 
++        // The game's tone mapping is complete here. NR precedes the SDR menu.
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++        if(cq){
++            const auto& output=State::Instance().outputColorSpace;
++            bool sdr=!State::Instance().hdrOutputActive&&(!output.valid||output.transfer==ColorTransfer::SRGB);
++            auto feature=State::Instance().currentFeature;
++            NativeNrPresentSdr(cq,pSwapChain,sdr,feature?feature->DisplayWidth():0,feature?feature->DisplayHeight():0);
++        }
++#endif
+         // Draw overlay
+         MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
+ 
+@@ -544,6 +556,19 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
+     _id = ++scCount;
+     _lastFlags = flags;
+ 
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++    // Capture at swapchain setup, including when OverlayMenu is disabled.
++    // The factory already unwraps pDevice before passing it to this constructor.
++    Microsoft::WRL::ComPtr<ID3D12CommandQueue> nrQueue;
++    if(pDevice && SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&nrQueue))))
++    {
++        if(D3D12Hooks::HookCommandQueue(nrQueue.Get()))
++            LOG_INFO("Native NR swapchain queue observed (overlay independent), OverlayMenu={}", Config::Instance()->OverlayMenu.value_or_default());
++        else
++            LOG_ERROR("Native NR swapchain queue setup rejected; leaving NR disabled");
++    }
++#endif
++
+     _real->QueryInterface(IID_PPV_ARGS(&_real1));
+     if (_real1 != nullptr)
+         _real1->Release();
+@@ -568,7 +593,11 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
+     LOG_INFO("{} created, real: {:X}, refCount: {}", _id, (UINT64) real, refCount);
+ }
+ 
+-WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4() {}
++WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4() {
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++    NativeNrReleasePresent(_real);
++#endif
++}
+ 
+ //
+ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, void** ppvObject)
+@@ -857,6 +886,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
+                                                                 DXGI_FORMAT NewFormat, UINT SwapChainFlags)
+ {
+     LOG_DEBUG("");
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++    auto nrRelease=NativeNrReleasePresent(_real);
++    if(FAILED(nrRelease))return nrRelease;
++#endif
+ 
+ #ifdef USE_LOCAL_MUTEX
+     // dlssg calls this from present it seems
+@@ -1247,6 +1280,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
+                                                                  const UINT* pCreationNodeMask,
+                                                                  IUnknown* const* ppPresentQueue)
+ {
++#if defined(OPTISCALER_NATIVE_NR_MODEL)
++    auto nrRelease=NativeNrReleasePresent(_real);
++    if(FAILED(nrRelease))return nrRelease;
++#endif
+     LOG_DEBUG("");
+ 
+ #ifdef USE_LOCAL_MUTEX

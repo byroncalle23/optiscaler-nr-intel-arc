@@ -1,0 +1,65 @@
+#define main nr_unused_graph_main
+#include "linalg_batch_graph.cpp"
+#undef main
+int main(int argc,char** argv){try{
+    if(argc!=2)throw std::runtime_error("Usage: attention_registers_unit output");
+    std::string folder=argv[1];std::filesystem::create_directories(nativePath(folder));
+    BatchGraphProbe probe;auto ctx=probe.sharedContext();ctx->tileBatch=2;
+    linAlgCheckWaveFP16(ctx->device.Get());auto root=linAlgWindowRoot(ctx->device.Get());
+    std::vector<ComPtr<ID3D12PipelineState>> pipelines;
+    for(const char* name:{"attention-softmax-wave8.dxil","attention-registers.dxil","attention-prob-baseline.dxil","attention-prob-registers.dxil"})pipelines.push_back(linAlgPso(ctx->device.Get(),root.Get(),name));
+    {
+        ctx->tileBatch=1;auto dummy=probe.make(128),out=probe.make(128);
+        auto map=linAlgPso(ctx->device.Get(),root.Get(),"attention-coordinate.dxil");
+        out->to(ctx->cmd.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ctx->cmd->SetComputeRootSignature(root.Get());ctx->cmd->SetPipelineState(map.Get());
+        ctx->cmd->SetComputeRootShaderResourceView(0,dummy->resource->GetGPUVirtualAddress());ctx->cmd->SetComputeRootShaderResourceView(1,dummy->resource->GetGPUVirtualAddress());ctx->cmd->SetComputeRootShaderResourceView(4,dummy->resource->GetGPUVirtualAddress());
+        ctx->cmd->SetComputeRootUnorderedAccessView(2,out->resource->GetGPUVirtualAddress());UINT constants[]={1,1,128,128};ctx->cmd->SetComputeRoot32BitConstants(3,4,constants,0);
+        ctx->cmd->Dispatch(1,1,1);probe.submit();auto actual=probe.downloadLanes(out);
+        for(UINT i=0;i<128;++i)if(actual[i]!=float(i))throw std::runtime_error("Matrix coordinate contract mismatch");
+        std::ofstream coordinates(nativePath(folder+"/coordinate.bin"),std::ios::binary);coordinates.write(reinterpret_cast<const char*>(actual.data()),actual.size()*4);if(!coordinates)throw std::runtime_error("Coordinate output write");
+        puts("ATTENTION_COORDINATE_PASS row_column_exact=1");ctx->tileBatch=2;
+    }
+    for(UINT channels:{32u,64u,128u,256u,512u}){
+        UINT heads=channels/32;auto input=probe.make(UINT64(128)*channels*3);auto contextOutput=probe.make(UINT64(128)*channels);auto normOutput=probe.make(UINT64(128)*channels*2);Tensor* output=contextOutput;
+        auto bias=probe.make(UINT64(heads)*4096,false);auto scale=probe.make(heads,false);
+        for(UINT pattern=0;pattern<3;++pattern){
+        std::vector<float> values(size_t(input->elements*2)),biasValues(size_t(bias->elements)),scales(heads);
+        for(size_t i=0;i<values.size();++i)values[i]=float(int((i*17+(i/32)*31+(i/input->elements)*73)%257)-128)/64;
+        if(pattern)for(size_t i=0;i<values.size();++i){
+            UINT plane=UINT(i%(channels*3))/channels;
+            if(plane<2)values[i]=pattern==1?0.0f:((i%channels)%8==0?float(int((i/32)%7)-3)/8192.0f:0.0f);
+        }
+        for(size_t i=0;i<biasValues.size();++i)biasValues[i]=float(int((i*11+i/64*7)%17)-8)/32;
+        for(UINT i=0;i<heads;++i)scales[i]=.5f+float(i)/16;
+        probe.uploadLanes(input,values);probe.uploadLanes(bias,biasValues);probe.uploadLanes(scale,scales);
+        std::vector<float> references[2];
+        auto run=[&](UINT policy){
+            input->to(ctx->cmd.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);bias->to(ctx->cmd.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);scale->to(ctx->cmd.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);output->to(ctx->cmd.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            ctx->cmd->SetComputeRootSignature(root.Get());ctx->cmd->SetPipelineState(pipelines[policy].Get());
+            ctx->cmd->SetComputeRootShaderResourceView(0,input->resource->GetGPUVirtualAddress());ctx->cmd->SetComputeRootShaderResourceView(1,bias->resource->GetGPUVirtualAddress());ctx->cmd->SetComputeRootShaderResourceView(4,scale->resource->GetGPUVirtualAddress());ctx->cmd->SetComputeRootUnorderedAccessView(2,output->resource->GetGPUVirtualAddress());
+            UINT constants[]={2*heads,heads,UINT(input->elements),UINT(output->elements)};ctx->cmd->SetComputeRoot32BitConstants(3,4,constants,0);ctx->cmd->Dispatch(2*heads,1,2);uavBarrier(ctx->cmd.Get());probe.submit();return probe.downloadLanes(output);
+        };
+        for(UINT policy=0;policy<4;++policy){
+            output=policy>=2?normOutput:contextOutput;
+            probe.uploadLanes(input,values);std::vector<float> first;
+            for(UINT repeat=0;repeat<3;++repeat){auto actual=run(policy);
+                for(float v:actual)if(!std::isfinite(v))throw std::runtime_error("Nonfinite partition unit");
+                if(!repeat)first=actual;else if(memcmp(first.data(),actual.data(),actual.size()*4))throw std::runtime_error("Partition unit repeat mismatch");}
+            if(policy%2==0)references[policy/2]=first;
+            double relative=0;
+            if(policy%2){double diff=0,energy=0;auto& ref=references[policy/2];for(size_t i=0;i<first.size();++i){double delta=double(first[i])-ref[i];diff+=delta*delta;energy+=double(ref[i])*ref[i];}relative=sqrt(diff/std::max(energy,1e-30));if(memcmp(first.data(),ref.data(),first.size()*4))throw std::runtime_error("Attention register policy output mismatch");}
+            auto changed=values;UINT selected=heads-1;
+            for(UINT token=64;token<128;++token)for(UINT plane=0;plane<3;++plane)for(UINT c=0;c<32;++c)changed[size_t(input->elements)+token*channels*3+plane*channels+selected*32+c]=changed[size_t(input->elements)+token*channels*3+plane*channels+selected*32+c]*-.75f+.125f+float(int(token%5)-2)/8;
+            probe.uploadLanes(input,changed);auto alt=run(policy);bool affected=false;
+            for(size_t i=0;i<first.size();++i){bool target=policy>=2?i>=output->elements+UINT64(2*heads-1)*4096:(i>=output->elements&&((i-output->elements)/channels)>=64&&(i%channels)/32==selected);
+                if(!target&&memcmp(&first[i],&alt[i],4))throw std::runtime_error("Partition batch/window/head contamination");
+                if(target&&first[i]!=alt[i])affected=true;}
+            if(!affected)throw std::runtime_error("Partition unit insensitive to changed values");
+            std::string name=folder+"/pattern"+std::to_string(pattern)+"-C"+std::to_string(channels)+"-P"+std::to_string(policy)+".bin";std::ofstream f(nativePath(name),std::ios::binary);f.write(reinterpret_cast<const char*>(first.data()),first.size()*4);if(!f)throw std::runtime_error("Partition unit output");
+            printf("ATTENTION_REGISTERS_UNIT_PASS pattern=%u C=%u policy=%u rmse=%.9g repeat_exact=1 isolation=1\n",pattern,channels,policy,relative);
+        }
+        }
+    }
+    puts("ATTENTION_REGISTERS_UNITS_PASS cases=60");return 0;
+}catch(const std::exception& e){fprintf(stderr,"%s\n",e.what());return 1;}}

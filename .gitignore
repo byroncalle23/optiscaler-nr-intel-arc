@@ -1,0 +1,16 @@
+work/
+ref/
+dist/
+__pycache__/
+*.dll
+*.exe
+*.bin
+*.onnx
+*.safetensors
+*.ptx
+*.cubin
+*.fatbin
+*.png
+*.jpg
+*.mp4
+*.zip
