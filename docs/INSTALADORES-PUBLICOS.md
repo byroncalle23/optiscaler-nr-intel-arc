@@ -1,6 +1,6 @@
 # Instaladores públicos sin pesos
 
-Se prepararon dos paquetes para GitHub Releases. **No activan NR por sí solos:** no incluyen pesos ni el runtime experimental Microsoft 721. Sus condiciones de preview no permiten redistribuir ese runtime; debe obtenerse de su proveedor para uso local. El paquete oficial es `Microsoft.Direct3D.D3D12` / `1.721.3-preview`, en NuGet.
+Los dos paquetes están publicados como [prerelease v1.2.0](https://github.com/byroncalle23/optiscaler-nr-intel-arc/releases/tag/v1.2.0-public-no-weights). Se verificaron los SHA-256 y tamaños de los tres archivos subidos, incluidos los checksums. **No activan NR por sí solos:** no incluyen pesos ni el runtime experimental Microsoft 721. Sus condiciones de preview no permiten redistribuir ese runtime; debe obtenerse de su proveedor para uso local. El paquete oficial es `Microsoft.Direct3D.D3D12` / `1.721.3-preview`, en NuGet.
 
 | Archivo | Compatibilidad del instalador | Tamaño | SHA-256 |
 |---|---|---:|---|

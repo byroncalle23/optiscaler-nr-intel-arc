@@ -35,4 +35,4 @@ Perder como máximo 40% desde 65 FPS significa al menos 39 FPS (25,64 ms). Bajo 
 | B580/Spider-Man 2 | Temporal y compacto aceptados en prueba del usuario | Todos los modos altos y transiciones exhaustivas |
 | B570 | Compilación y identificación de software | Arranque, capacidades reales, imagen, memoria y rendimiento |
 | Otros juegos | Instalador genérico | Contratos de recursos y pruebas reales |
-| Publicación binaria | Dos paquetes sin pesos/runtime preparados y probados | Subida a Releases y prueba en juego de esos paquetes públicos |
+| Publicación binaria | Dos paquetes sin pesos/runtime publicados, SHA remoto verificado | Prueba en juego de esos paquetes públicos |
