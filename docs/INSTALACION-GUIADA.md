@@ -11,6 +11,8 @@ El asistente reduce el trabajo manual: importa un paquete local, comprueba integ
 
 Son paquetes distintos de v1.2; la release anterior se conserva. B570 continúa sin validación física.
 
+Descarga: [v1.3.0-guided-no-weights](https://github.com/byroncalle23/optiscaler-nr-intel-arc/releases/tag/v1.3.0-guided-no-weights). Los tamaños y SHA-256 de los tres archivos publicados se verificaron contra los originales locales.
+
 ## Lo que necesita aportar el usuario
 
 Una carpeta que contenga `native_nr_modes` con los cinco paquetes convertidos compatibles:
@@ -59,5 +61,7 @@ Cerrar el juego y usar Restaurar/desinstalar. Los archivos que el asistente impo
 ## Evidencia de pruebas
 
 Las pruebas son aisladas, con el juego cerrado: no equivalen a una sesión real en otro equipo. La comprobación del SDK descarga el paquete oficial y verifica que sus tres binarios esperados coinciden con el contrato; no activa opciones de Windows ni ejecuta la inferencia. La aceptación de términos y el selector de carpetas requieren interacción del usuario y se revisan como parte de la interfaz.
+
+Resultado: **34 comprobaciones pasadas** entre ambas variantes, incluidos perfiles, modelo ausente, geometría inválida, descarga/extracción del SDK oficial, importación automática real de cinco paquetes, registro y desinstalación restaurando archivos anteriores. No se cambiaron instalaciones reales de juegos ni ajustes de Windows. La interfaz principal se inspeccionó mediante preview; no se automatizó toda la interacción de aceptación de licencia en una sesión de usuario.
 
 Código: `installer/GuidedSetup.cs`, `installer/GenericInstaller.cs`, `tools/build_public_installers.py --guided` y `tools/test_public_installers.py --guided`.
