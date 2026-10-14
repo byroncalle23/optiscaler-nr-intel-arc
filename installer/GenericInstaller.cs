@@ -63,7 +63,11 @@ public static class Engine {
   return p;
  }
  public static void Closed(string executable=null){if(!String.IsNullOrEmpty(executable)&&Process.GetProcessesByName(Path.GetFileNameWithoutExtension(executable)).Length!=0)throw new IOException("Cierra el juego elegido, tambien en el Administrador de tareas.");}
- public static bool SupportedHardware(string id){var parts=(id??"").ToUpperInvariant().Replace('\\','&').Split('&');return Array.IndexOf(parts,"VEN_8086")>=0&&(Array.IndexOf(parts,"DEV_E20B")>=0||Array.IndexOf(parts,"DEV_E20C")>=0);}
+ public static bool SupportedHardware(string id){var parts=(id??"").ToUpperInvariant().Replace('\\','&').Split('&');return Array.IndexOf(parts,"VEN_8086")>=0&&(Array.IndexOf(parts,"DEV_E20B")>=0
+#if !B580_ONLY
+ ||Array.IndexOf(parts,"DEV_E20C")>=0
+#endif
+ );}
  static void Hardware(){using(var q=new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_VideoController")){bool found=false;foreach(ManagementObject x in q.Get()){if(SupportedHardware(Convert.ToString(x["PNPDeviceID"])))found=true;}if(!found)throw new IOException("NR requiere Intel Arc B580 o B570 (B570 experimental, sin validacion fisica).");}}
  public static string Payload(Item item){if(item.blob==null||item.blob!=item.sha256||item.blob.Length!=64||item.blob.Any(c=>!((c>='0'&&c<='9')||(c>='a'&&c<='f'))))throw new IOException("Blob invalido");return "blobs/"+item.blob;}
  public static Package Verify(ZipArchive zip,Action<string> log){
@@ -121,6 +125,9 @@ public static class Engine {
     WriteManaged(state,"OptiScaler.ini",Encoding.UTF8.GetBytes(updated),log);
    }
    var launchProfile=new Dictionary<string,object>{{"executable",Path.GetFileName(exe)},{"exe_sha256",Hash(exe)},{"dll",wrapper},{"dll_sha256",package.files.First(x=>x.path=="dxgi.dll").sha256},{"profile",Path.GetFileName(exe).Equals("Spider-Man2.exe",StringComparison.OrdinalIgnoreCase)?"Spider-Man 2 / referencia":"DX12 SDR / experimental"}};
+#if PUBLIC_PACKAGE
+   launchProfile["model_required"]=true;
+#endif
    launchProfile["runtime_files"]=package.files.Where(x=>x.path.StartsWith("native_nr_runtime/",StringComparison.Ordinal)).Select(x=>new Dictionary<string,object>{{"path",x.path},{"sha256",x.sha256}}).ToArray();
    launchProfile["asset_manifests"]=package.files.Where(x=>x.path.StartsWith("native_nr_modes/",StringComparison.Ordinal)&&x.path.EndsWith("/assets.txt",StringComparison.Ordinal)).Select(x=>new Dictionary<string,object>{{"path",x.path},{"sha256",x.sha256}}).ToArray();
    WriteManaged(state,"nr-launcher/profile.json",Encoding.UTF8.GetBytes(Json.Serialize(launchProfile)),log);
@@ -145,6 +152,35 @@ public static class Engine {
   if(!String.Equals(Path.GetFullPath(game),state.game,StringComparison.OrdinalIgnoreCase))throw new IOException("El registro pertenece a otra carpeta");
   Restore(state,log);
  }
+ public static void RegisterLocalModel(string executable,Action<string> log,bool verifyOnly=false){
+  string exe=Path.GetFullPath(executable),game=Path.GetDirectoryName(exe);Closed(exe);Hardware();ValidateExecutable(exe);
+  var state=Json.Deserialize<State>(File.ReadAllText(Journal(game)));
+  if(state.game!=game||state.executable!=exe||!state.complete||state.removed)throw new IOException("Instala primero este paquete publico en el juego elegido.");
+  var manifests=new List<Dictionary<string,object>>();int[,] geometry={{320,180,320,192},{512,288,512,320},{640,360,640,384},{960,540,960,576},{1280,720,1280,768}};
+  for(int i=0;i<5;i++){
+   string relative="native_nr_modes/assets-"+geometry[i,1]+"/assets.txt",manifest=Safe(game,relative),model=Path.GetDirectoryName(manifest);
+   string[] rows=File.ReadAllLines(manifest);if(rows.Length<4||rows[0]!="NR_NATIVE_ASSETS 1")throw new IOException("Manifiesto de modelo invalido: "+relative);
+   string expected="geometry "+geometry[i,1]+" "+geometry[i,0]+" "+geometry[i,3]+" "+geometry[i,2];if(rows[1]!=expected)throw new IOException("Geometria incompatible: "+relative);
+   int count;var header=rows[2].Split(' ');if(header.Length!=2||header[0]!="files"||!int.TryParse(header[1],out count)||count<1||count>5000||rows.Length!=count+3)throw new IOException("Conteo de archivos invalido.");
+   var names=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+   foreach(string row in rows.Skip(3)){var col=row.Split(new[]{' '},3);long bytes;
+    if(col.Length!=3||!long.TryParse(col[0],out bytes)||bytes<0||col[1].Length!=64||!names.Add(col[2]))throw new IOException("Entrada de modelo invalida.");
+    string file=Safe(model,col[2]);if(!File.Exists(file)||new FileInfo(file).Length!=bytes||Hash(file)!=col[1])throw new IOException("Modelo incompleto o alterado: "+col[2]);}
+   manifests.Add(new Dictionary<string,object>{{"path",relative},{"sha256",Hash(manifest)}});
+  }
+  var contract=Json.Deserialize<List<Item>>(File.ReadAllText(Safe(game,"nr-launcher/runtime-contract.json")));
+  if(contract==null||contract.Count==0||contract.Count>32)throw new IOException("Contrato SDK invalido.");
+  foreach(var item in contract){if(!item.path.StartsWith("native_nr_runtime/",StringComparison.Ordinal))throw new IOException("Ruta SDK invalida.");string file=Safe(game,item.path);if(!File.Exists(file)||new FileInfo(file).Length!=item.bytes||Hash(file)!=item.sha256)throw new IOException("Runtime local ausente o incompatible: "+item.path);}
+  if(verifyOnly){log("Modelo local y runtime verificados; no se modificaron archivos ni Windows.");return;}
+  var profile=Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Safe(game,"nr-launcher/profile.json")));
+  if(Hash(exe)!=(string)profile["exe_sha256"]||Hash(Safe(game,(string)profile["dll"]))!=(string)profile["dll_sha256"])throw new IOException("Ejecutable o DLL cambiaron.");
+  profile["runtime_files"]=contract.Select(x=>new Dictionary<string,object>{{"path",x.path},{"sha256",x.sha256}}).ToArray();profile["asset_manifests"]=manifests.ToArray();profile["model_required"]=false;
+  WriteManaged(state,"nr-launcher/profile.json",Encoding.UTF8.GetBytes(Json.Serialize(profile)),log);
+  string ini=File.ReadAllText(Safe(game,"native_nr.ini"));var regex=new System.Text.RegularExpressions.Regex(@"(?m)^GlobalB1\s*=.*$");
+  if(regex.Matches(ini).Count!=1)throw new IOException("Configuracion GlobalB1 ambigua.");
+  WriteManaged(state,"native_nr.ini",Encoding.UTF8.GetBytes(regex.Replace(ini,"GlobalB1=1")),log);
+  log("Modelo local registrado. NR sigue desactivado inicialmente; usa el lanzador NR.");
+ }
 }
 
 public class InstallerForm : Form {
@@ -152,6 +188,14 @@ public class InstallerForm : Form {
  public InstallerForm(string exe){this.exe=exe;Text="OptiScaler + Neural Rendering — DX12 / Arc B570 y B580";ClientSize=new Size(760,510);StartPosition=FormStartPosition.CenterScreen;MinimumSize=Size;Font=new Font("Segoe UI",10);
   var title=new Label{Text="OptiScaler + Neural Rendering — cinco modos",Font=new Font("Segoe UI",17,FontStyle.Bold),Left=20,Top=18,Width=715,Height=35};Controls.Add(title);
   Controls.Add(new Label{Text="DX12 / SDR · B580 referencia probada · B570 experimental sin prueba fisica\nCinco modos de 180p a 720p; inicio 320x180 con NR desactivado.\nReferencia: Spider-Man 2. Otros juegos: compatibilidad experimental.",Left=20,Top=65,Width=710,Height=90});
+#if PUBLIC_PACKAGE
+  foreach(Control control in Controls)if(control is Label&&control.Top==65)control.Text="PAQUETE PUBLICO SIN PESOS NI SDK EXPERIMENTAL. NR requiere aporte local.\nOptiScaler base puede usarse sin NR. Consulta LEEME-Publico.txt.\nB580 referencia; B570 experimental solo en la variante B570-B580.";
+  var register=new Button{Text="Modelo local",Left=637,Top=211,Width=105,Height=35};Controls.Add(register);
+  register.Click+=(s,e)=>{if(busy)return;try{Engine.RegisterLocalModel(folder.Text.Trim(),Print);}catch(Exception error){Print("Error: "+error.Message);}};
+#endif
+#if B580_ONLY
+  Text="OptiScaler + NR — B580 / paquete publico";
+#endif
   folder.SetBounds(20,164,615,30);folder.Text="";Controls.Add(folder);
   browse.Text="Elegir…";browse.SetBounds(643,164,96,30);browse.Click+=(s,e)=>{using(var d=new OpenFileDialog()){d.Title="Ejecutable real del juego DX12";d.Filter="Ejecutable (*.exe)|*.exe";if(d.ShowDialog()==DialogResult.OK)folder.Text=d.FileName;}};Controls.Add(browse);
   Controls.Add(new Label{Text="Metodo de carga",Left=465,Top=194,Width=160,Height=16});
@@ -181,6 +225,8 @@ public static class Program {
   if(file.Length<32)throw new IOException("No hay paquete incrustado");file.Position=file.Length-32;using(var r=new BinaryReader(file,Encoding.ASCII,true)){if(Encoding.ASCII.GetString(r.ReadBytes(16))!="NRSETUPGENV1PACK")throw new IOException("Paquete no encontrado");offset=r.ReadInt64();length=r.ReadInt64();if(offset<=0||length<=0||offset+length!=file.Length-32)throw new IOException("Paquete truncado");}
  }
  [STAThread] public static int Main(string[] args){try{
+  if(args.Length==2&&args[0]=="--register-model"){Engine.RegisterLocalModel(args[1],Console.WriteLine);return 0;}
+  if(args.Length==2&&args[0]=="--check-model"){Engine.RegisterLocalModel(args[1],Console.WriteLine,true);return 0;}
   if(args.Length==2&&args[0]=="--hardware-test"){Console.WriteLine(Engine.SupportedHardware(args[1])?"SUPPORTED":"UNSUPPORTED");return Engine.SupportedHardware(args[1])?0:1;}
   if(args.Length==2&&args[0]=="--preview"){Application.EnableVisualStyles();using(var form=new InstallerForm(Application.ExecutablePath)){form.ShowInTaskbar=false;form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-32000,-32000);form.Show();Application.DoEvents();using(var bitmap=new Bitmap(form.Width,form.Height)){form.DrawToBitmap(bitmap,new Rectangle(0,0,form.Width,form.Height));bitmap.Save(args[1],System.Drawing.Imaging.ImageFormat.Png);}form.Close();}return 0;}
   if(args.Length==2&&args[0]=="--verify"){using(var f=File.OpenRead(args[1])){long o,l;Footer(f,out o,out l);using(var s=new Slice(f,o,l))using(var zip=new ZipArchive(s,ZipArchiveMode.Read))Engine.Verify(zip,Console.WriteLine);}return 0;}

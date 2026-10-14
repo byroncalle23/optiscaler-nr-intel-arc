@@ -6,7 +6,7 @@ Este es un port de investigación basado en un modelo recuperado por terceros. N
 
 ## Estado de la publicación
 
-Se publica el código de la ruta nativa, shaders propios, integración, instalador y documentación. **No se publican pesos, paquetes de modelo, DLL NVIDIA, capturas de juegos ni instaladores completos que los contengan.** Los dos instaladores locales completos están identificados en [artefactos](docs/ARTEFACTOS.md); su descarga pública queda pendiente. El código no es una descarga lista para activar NR sin aportar dependencias y modelo local.
+Se publica el código de la ruta nativa, shaders propios, integración, instalador y documentación. **No se publican pesos, paquetes de modelo, DLL NVIDIA, capturas de juegos ni instaladores completos que los contengan.** Se han preparado [dos instaladores públicos sin pesos ni SDK experimental](docs/INSTALADORES-PUBLICOS.md) para Releases. Instalan OptiScaler y requieren aportar/verificar el modelo y runtime localmente para activar NR. Los paquetes locales completos siguen excluidos.
 
 La ruta admite elegir un ejecutable DX12, pero **no está validada en cualquier juego**. El temporal depende de que se capturen recursos, estados y metadatos correctos del motor. El instalador general rechaza Requiem para conservar su integración específica.
 
@@ -38,5 +38,6 @@ La ruta admite elegir un ejecutable DX12, pero **no está validada en cualquier 
 5. [Cómo continuar y mejorar](docs/CONTINUAR-DESARROLLO.md).
 6. [Artefactos, verificaciones y límites](docs/ARTEFACTOS.md).
 7. [Procedencia y licencias](NOTICE.md).
+8. [Instaladores públicos: contenido, aporte local y hashes](docs/INSTALADORES-PUBLICOS.md).
 
 Los ficheros de `src/native` incluyen ensayos descartados además de producción. **No activar todos los defines experimentales**: el script de compilación fija la política aceptada. Los resultados históricos no prueban que todo el directorio esté validado para publicación o despliegue en juego.
